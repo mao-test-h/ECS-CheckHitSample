@@ -85,7 +85,6 @@ namespace MainContents
         struct CheckHitJob : IJobProcessComponentData<SphereCollider, Destroyable>
         {
             [ReadOnly] public NativeArray<SphereCollider> PlayerColliders;
-            public CheckHitJob(NativeArray<SphereCollider> playerColliders) => this.PlayerColliders = playerColliders;
             public void Execute([ReadOnly] ref SphereCollider checkHitCollider, ref Destroyable destroyable)
             {
                 for (int i = 0; i < this.PlayerColliders.Length; ++i)
@@ -125,7 +124,8 @@ namespace MainContents
 
             // Allocate Memory
             this._playerColliders = new NativeArray<SphereCollider>(
-                playerGroupLength, Allocator.TempJob,
+                playerGroupLength,
+                Allocator.TempJob,
                 NativeArrayOptions.UninitializedMemory);
 
             // ComponentDataArray
@@ -200,10 +200,8 @@ namespace MainContents
                 {
                     var offset = center + this.Offsets[j] * sphereCollider.Radius;
                     var hash = GridHash.Hash(offset, this.CellRadius);
-                    if (hash != hashCenter)
-                    {
-                        this.Hashmap.Add(hash, i);
-                    }
+                    if (hash == hashCenter) { continue; }
+                    this.Hashmap.Add(hash, i);
                 }
             }
         }
@@ -212,16 +210,13 @@ namespace MainContents
         /// 当たり判定(CheckHit → Player)
         /// </summary>
         [BurstCompile]
-        struct CheckHitJob : IJobParallelFor
+        struct CheckHitJob : IJobProcessComponentData<SphereCollider, Destroyable>
         {
             public float CellRadius;
-            [ReadOnly] public NativeArray<SphereCollider> CheckHitColliders;
             [ReadOnly] public NativeArray<SphereCollider> PlayerColliders;
             [ReadOnly] public NativeMultiHashMap<int, int> PlayerHashmap;
-            public ComponentDataArray<Destroyable> Destroyables;
-            public void Execute(int i)
+            public void Execute([ReadOnly] ref SphereCollider checkHitCollider, ref Destroyable destroyable)
             {
-                var checkHitCollider = this.CheckHitColliders[i];
                 int hash = GridHash.Hash(checkHitCollider.Position, this.CellRadius);
                 int index; NativeMultiHashMapIterator<int> iterator;
                 for (bool success = this.PlayerHashmap.TryGetFirstValue(hash, out index, out iterator);
@@ -232,7 +227,7 @@ namespace MainContents
                     if (checkHitCollider.Intersect(ref playerCollider))
                     {
                         // ヒット
-                        this.Destroyables[i] = Destroyable.Kill;
+                        destroyable = Destroyable.Kill;
                     }
                 }
             }
@@ -245,12 +240,10 @@ namespace MainContents
         const int MaxGridNum = 3 * 3 * 3;
         const float CellRadius = 8f;
 
-        ComponentGroup _playerGroup;
-        ComponentGroup _checkHitGroup;
-
         NativeArray<float3> _offsets;
+
+        ComponentGroup _playerGroup;
         NativeArray<SphereCollider> _playerColliders;
-        NativeArray<SphereCollider> _checkHitColliders;
         NativeMultiHashMap<int, int> _playerHashmap;
 
         #endregion // Private Fields
@@ -294,7 +287,6 @@ namespace MainContents
 
             // ComponentGroupの設定
             this._playerGroup = GetComponentGroup(ComponentType.ReadOnly<Player>(), ComponentType.ReadOnly<SphereCollider>());
-            this._checkHitGroup = GetComponentGroup(ComponentType.ReadOnly<CheckHit>(), ComponentType.ReadOnly<SphereCollider>(), ComponentType.Create<Destroyable>());
         }
 
         protected override void OnDestroyManager()
@@ -307,70 +299,51 @@ namespace MainContents
         {
             this.DisposeBuffers();
             var handle = inputDeps;
-
             var playerGroupLength = this._playerGroup.CalculateLength();
-            var checkHitGroupLength = this._checkHitGroup.CalculateLength();
+
             // ---------------------
             // Allocate Memory
-
             this._playerColliders = new NativeArray<SphereCollider>(
-                playerGroupLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            this._checkHitColliders = new NativeArray<SphereCollider>(
-                checkHitGroupLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+                playerGroupLength,
+                Allocator.TempJob,
+                NativeArrayOptions.UninitializedMemory);
 
             this._playerHashmap = new NativeMultiHashMap<int, int>(
-                playerGroupLength * MaxGridNum, Allocator.TempJob);
-
+                playerGroupLength * MaxGridNum,
+                Allocator.TempJob);
 
             // ---------------------
-            // Copy & Hashmap Settings
-
-            // ComponentDataArrayのコピー
-            var copyPlayerColliderJob = new CopyComponentData<SphereCollider>
+            // ComponentDataArray
+            var copyPlayerColliderJobHandle = new CopyComponentData<SphereCollider>
             {
                 Source = this._playerGroup.GetComponentDataArray<SphereCollider>(),
                 Results = this._playerColliders,
-            };
-            var copyPlayerColliderJobHandle = copyPlayerColliderJob.Schedule(playerGroupLength, 32, handle);
+            }.Schedule(playerGroupLength, 32, handle);
 
-            var copyCheckHitColliderJob = new CopyComponentData<SphereCollider>
-            {
-                Source = this._checkHitGroup.GetComponentDataArray<SphereCollider>(),
-                Results = this._checkHitColliders,
-            };
-            var copyCheckHitColliderJobHandle = copyCheckHitColliderJob.Schedule(checkHitGroupLength, 32, handle);
-
-            // HashPositionsの設定
-            var playerHashmapJob = new HashPositions
+            // Hashmap Settings
+            var playerHashmapJobHandle = new HashPositions
             {
                 CellRadius = CellRadius,
                 Offsets = this._offsets,
                 SphereColliders = this._playerGroup.GetComponentDataArray<SphereCollider>(),
                 Hashmap = this._playerHashmap.ToConcurrent(),
-            };
-            var playerHashmapJobHandle = playerHashmapJob.Schedule(playerGroupLength, 32, handle);
+            }.Schedule(playerGroupLength, 32, handle);
 
-            // Jobの依存関係の結合
-            var handles = new NativeArray<JobHandle>(3, Allocator.Temp);
+            // ※Jobの依存関係の結合
+            var handles = new NativeArray<JobHandle>(2, Allocator.Temp);
             handles[0] = copyPlayerColliderJobHandle;
-            handles[1] = copyCheckHitColliderJobHandle;
-            handles[2] = playerHashmapJobHandle;
+            handles[1] = playerHashmapJobHandle;
             handle = JobHandle.CombineDependencies(handles);
             handles.Dispose();
 
-
             // ---------------------
             // Check Hit
-
-            var job = new CheckHitJob
+            handle = new CheckHitJob
             {
                 CellRadius = CellRadius,
                 PlayerColliders = this._playerColliders,
-                CheckHitColliders = this._checkHitColliders,
                 PlayerHashmap = this._playerHashmap,
-                Destroyables = this._checkHitGroup.GetComponentDataArray<Destroyable>(),
-            };
-            handle = job.Schedule(this._checkHitColliders.Length, 32, handle);
+            }.Schedule(this, handle);
 
             return handle;
         }
@@ -383,7 +356,6 @@ namespace MainContents
         void DisposeBuffers()
         {
             if (this._playerColliders.IsCreated) { this._playerColliders.Dispose(); }
-            if (this._checkHitColliders.IsCreated) { this._checkHitColliders.Dispose(); }
             if (this._playerHashmap.IsCreated) { this._playerHashmap.Dispose(); }
         }
 
