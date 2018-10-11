@@ -1,2 +1,2 @@
 # ECS-CheckHitSample
-PureECS 当たり判定サンプル
+球体形状を前提としたPureECSでの衝突判定サンプル
