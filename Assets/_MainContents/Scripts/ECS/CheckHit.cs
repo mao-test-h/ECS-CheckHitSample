@@ -82,21 +82,19 @@ namespace MainContents
         /// 当たり判定(CheckHit → Player)
         /// </summary>
         [BurstCompile]
-        struct CheckHitJob : IJobParallelFor
+        struct CheckHitJob : IJobProcessComponentData<SphereCollider, Destroyable>
         {
-            [ReadOnly] public NativeArray<SphereCollider> CheckHitColliders;
             [ReadOnly] public NativeArray<SphereCollider> PlayerColliders;
-            public ComponentDataArray<Destroyable> Destroyables;
-            public void Execute(int i)
+            public CheckHitJob(NativeArray<SphereCollider> playerColliders) => this.PlayerColliders = playerColliders;
+            public void Execute([ReadOnly] ref SphereCollider checkHitCollider, ref Destroyable destroyable)
             {
-                var checkHitCollider = this.CheckHitColliders[i];
-                for (int j = 0; j < this.PlayerColliders.Length; ++j)
+                for (int i = 0; i < this.PlayerColliders.Length; ++i)
                 {
-                    var playerCollider = this.PlayerColliders[j];
+                    var playerCollider = this.PlayerColliders[i];
                     if (checkHitCollider.Intersect(ref playerCollider))
                     {
                         // ヒット
-                        this.Destroyables[i] = Destroyable.Kill;
+                        destroyable = Destroyable.Kill;
                     }
                 }
             }
@@ -108,27 +106,15 @@ namespace MainContents
         #region // Private Fields
 
         ComponentGroup _playerGroup;
-        ComponentGroup _checkHitGroup;
-
         NativeArray<SphereCollider> _playerColliders;
-        NativeArray<SphereCollider> _checkHitColliders;
 
         #endregion // Private Fields
 
         // ----------------------------------------------------
         #region // Protected Methods
 
-        protected override void OnCreateManager()
-        {
-            // ComponentGroupの設定
-            this._playerGroup = GetComponentGroup(ComponentType.ReadOnly<Player>(), ComponentType.ReadOnly<SphereCollider>());
-            this._checkHitGroup = GetComponentGroup(ComponentType.ReadOnly<CheckHit>(), ComponentType.ReadOnly<SphereCollider>(), ComponentType.Create<Destroyable>());
-        }
-
-        protected override void OnDestroyManager()
-        {
-            this.DisposeBuffers();
-        }
+        protected override void OnCreateManager() => this._playerGroup = GetComponentGroup(ComponentType.ReadOnly<Player>(), ComponentType.ReadOnly<SphereCollider>());
+        protected override void OnDestroyManager() => this.DisposeBuffers();
 
         protected override JobHandle OnUpdate(JobHandle inputDeps)
         {
@@ -136,52 +122,24 @@ namespace MainContents
             var handle = inputDeps;
 
             var playerGroupLength = this._playerGroup.CalculateLength();
-            var checkHitGroupLength = this._checkHitGroup.CalculateLength();
-            // ---------------------
+
             // Allocate Memory
-
             this._playerColliders = new NativeArray<SphereCollider>(
-                playerGroupLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            this._checkHitColliders = new NativeArray<SphereCollider>(
-                checkHitGroupLength, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+                playerGroupLength, Allocator.TempJob,
+                NativeArrayOptions.UninitializedMemory);
 
-
-            // ---------------------
-            // Copy
-
-            // ComponentDataArrayのコピー
-            var copyPlayerColliderJob = new CopyComponentData<SphereCollider>
+            // ComponentDataArray
+            handle = new CopyComponentData<SphereCollider>
             {
                 Source = this._playerGroup.GetComponentDataArray<SphereCollider>(),
                 Results = this._playerColliders,
-            };
-            var copyPlayerColliderJobHandle = copyPlayerColliderJob.Schedule(playerGroupLength, 32, handle);
+            }.Schedule(playerGroupLength, 32, handle); ;
 
-            var copyCheckHitColliderJob = new CopyComponentData<SphereCollider>
-            {
-                Source = this._checkHitGroup.GetComponentDataArray<SphereCollider>(),
-                Results = this._checkHitColliders,
-            };
-            var copyCheckHitColliderJobHandle = copyCheckHitColliderJob.Schedule(checkHitGroupLength, 32, handle);
-
-            // Jobの依存関係の結合
-            var handles = new NativeArray<JobHandle>(2, Allocator.Temp);
-            handles[0] = copyPlayerColliderJobHandle;
-            handles[1] = copyCheckHitColliderJobHandle;
-            handle = JobHandle.CombineDependencies(handles);
-            handles.Dispose();
-
-
-            // ---------------------
             // Check Hit
-
-            var job = new CheckHitJob
+            handle = new CheckHitJob
             {
-                PlayerColliders = this._playerColliders,
-                CheckHitColliders = this._checkHitColliders,
-                Destroyables = this._checkHitGroup.GetComponentDataArray<Destroyable>(),
-            };
-            handle = job.Schedule(this._checkHitColliders.Length, 32, handle);
+                PlayerColliders = this._playerColliders
+            }.Schedule(this, handle);
 
             return handle;
         }
@@ -194,7 +152,6 @@ namespace MainContents
         void DisposeBuffers()
         {
             if (this._playerColliders.IsCreated) { this._playerColliders.Dispose(); }
-            if (this._checkHitColliders.IsCreated) { this._checkHitColliders.Dispose(); }
         }
 
         #endregion // Private Methods
